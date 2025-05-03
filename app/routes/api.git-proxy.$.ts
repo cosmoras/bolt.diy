@@ -57,7 +57,6 @@ async function handleProxyRequest(request: Request, path: string | undefined) {
       return json({ error: 'Invalid proxy URL format' }, { status: 400 });
     }
 
-    // Handle CORS preflight request
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 200,
@@ -71,95 +70,79 @@ async function handleProxyRequest(request: Request, path: string | undefined) {
       });
     }
 
-    // Extract domain and remaining path
     const parts = path.match(/([^\/]+)\/?(.*)/);
-
     if (!parts) {
       return json({ error: 'Invalid path format' }, { status: 400 });
     }
 
     const domain = parts[1];
     const remainingPath = parts[2] || '';
-
-    // Reconstruct the target URL with query parameters
     const url = new URL(request.url);
     const targetURL = `https://${domain}/${remainingPath}${url.search}`;
 
     console.log('Target URL:', targetURL);
 
-    // Filter and prepare headers
     const headers = new Headers();
-
-    // Only forward allowed headers
     for (const header of ALLOW_HEADERS) {
       if (request.headers.has(header)) {
         headers.set(header, request.headers.get(header)!);
       }
     }
-
-    // Set the host header
     headers.set('Host', domain);
 
-    // Set Git user agent if not already present
-    if (!headers.has('user-agent') || !headers.get('user-agent')?.startsWith('git/')) {
-      headers.set('User-Agent', 'git/@isomorphic-git/cors-proxy');
+    // Set a default User-Agent only if none is provided
+    if (!headers.has('user-agent')) {
+      headers.set('User-Agent', 'MyProxyApp/1.0'); // Replace with your app name
+    }
+
+    // Require Authorization for GitHub API requests
+    if (targetURL.startsWith('https://api.github.com') && !headers.has('authorization')) {
+      return json({ error: 'Missing Authorization header for GitHub API' }, { status: 400 });
     }
 
     console.log('Request headers:', Object.fromEntries(headers.entries()));
 
-    // Prepare fetch options
     const fetchOptions: RequestInit = {
       method: request.method,
       headers,
       redirect: 'follow',
     };
 
-    // Add body for non-GET/HEAD requests
     if (!['GET', 'HEAD'].includes(request.method)) {
       fetchOptions.body = request.body;
-      fetchOptions.duplex = 'half';
-
-      /*
-       * Note: duplex property is removed to ensure TypeScript compatibility
-       * across different environments and versions
-       */
     }
 
-    // Forward the request to the target URL
     const response = await fetch(targetURL, fetchOptions);
-
     console.log('Response status:', response.status);
 
-    // Create response headers
-    const responseHeaders = new Headers();
+    // Log error details if status is 400 or higher
+    let responseBody = response.body;
+    if (response.status >= 400) {
+      const errorText = await response.text();
+      console.error('Target server error:', response.status, errorText);
+      responseBody = errorText;
+    }
 
-    // Add CORS headers
+    const responseHeaders = new Headers();
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     responseHeaders.set('Access-Control-Allow-Headers', ALLOW_HEADERS.join(', '));
     responseHeaders.set('Access-Control-Expose-Headers', EXPOSE_HEADERS.join(', '));
 
-    // Copy exposed headers from the target response
     for (const header of EXPOSE_HEADERS) {
-      // Skip content-length as we'll use the original response's content-length
-      if (header === 'content-length') {
-        continue;
-      }
-
+      if (header === 'content-length') continue;
       if (response.headers.has(header)) {
         responseHeaders.set(header, response.headers.get(header)!);
       }
     }
 
-    // If the response was redirected, add the x-redirected-url header
     if (response.redirected) {
       responseHeaders.set('x-redirected-url', response.url);
     }
 
     console.log('Response headers:', Object.fromEntries(responseHeaders.entries()));
 
-    // Return the response with the target's body stream piped directly
-    return new Response(response.body, {
+    return new Response(responseBody, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders,
