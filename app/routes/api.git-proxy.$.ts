@@ -1,3 +1,5 @@
+// #changing full code for async function handleProxyRequest(request: Request, path: string | undefined) here due to connection issues with github 
+
 import { json } from '@remix-run/cloudflare';
 import type { ActionFunctionArgs, LoaderFunctionArgs } from '@remix-run/cloudflare';
 
