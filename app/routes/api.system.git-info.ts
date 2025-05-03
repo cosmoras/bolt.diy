@@ -1,5 +1,15 @@
 import { json, type LoaderFunction, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 
+// --- Configuration ---
+// Set to true to enable detailed logging of GitHub API errors, including response body.
+// Set to false to disable detailed error logging in production.
+const DEBUG_MODE = true;
+
+// Define a User-Agent string for GitHub API requests.
+// Replace 'YourAppName/1.0 (you@example.com)' with your actual application name and contact info.
+const GITHUB_USER_AGENT = 'Bolt.DIY/1.0 (YourAppName/1.0)';
+// --- End of Configuration ---
+
 interface GitInfo {
   local: {
     commitHash: string;
@@ -67,104 +77,130 @@ export const loader: LoaderFunction = async ({ request, context }: LoaderFunctio
   // Handle CORS preflight requests
   if (request.method === 'OPTIONS') {
     return new Response(null, {
+      status: 200, // Added status 200 for clarity
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization', // Ensure Authorization is allowed
       },
     });
   }
+
+  // Standard CORS headers for actual responses
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', // Reflect allowed methods
+  };
 
   const { searchParams } = new URL(request.url);
   const action = searchParams.get('action');
 
   console.log('Git info action:', action);
 
+  // --- GitHub API Actions ---
   if (action === 'getUser' || action === 'getRepos' || action === 'getOrgs' || action === 'getActivity') {
-    // Use server-side token instead of client-side token
+    // Determine the token source
     const serverGithubToken = process.env.GITHUB_ACCESS_TOKEN || context.env?.GITHUB_ACCESS_TOKEN;
     const cookieToken = request.headers
       .get('Cookie')
       ?.split(';')
       .find((cookie) => cookie.trim().startsWith('githubToken='))
       ?.split('=')[1];
-
-    // Also check for token in Authorization header
     const authHeader = request.headers.get('Authorization');
     const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
 
-    const token = serverGithubToken || headerToken || cookieToken;
+    // Prioritize header token, then server env, then cookie
+    const token = headerToken || serverGithubToken || cookieToken;
+    const tokenSource = headerToken ? 'auth header' : serverGithubToken ? 'server env' : cookieToken ? 'cookie' : 'none';
 
-    console.log(
-      'Using GitHub token from:',
-      serverGithubToken ? 'server env' : headerToken ? 'auth header' : cookieToken ? 'cookie' : 'none',
-    );
+    console.log('Using GitHub token from:', tokenSource);
 
     if (!token) {
       console.error('No GitHub token available');
       return json(
-        { error: 'No GitHub token available' },
+        { error: 'Authentication required: No GitHub token available.' },
         {
           status: 401,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          },
+          headers: corsHeaders,
         },
       );
     }
 
+    // Define common headers for GitHub API calls
+    const githubApiHeaders = {
+      Accept: 'application/vnd.github.v3+json',
+      Authorization: `Bearer ${token}`,
+      'User-Agent': GITHUB_USER_AGENT, // Add required User-Agent
+    };
+
     try {
+      // --- Get User Action ---
       if (action === 'getUser') {
         const response = await fetch('https://api.github.com/user', {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: githubApiHeaders,
         });
 
         if (!response.ok) {
-          console.error('GitHub user API error:', response.status);
-          throw new Error(`GitHub API error: ${response.status}`);
+          const errorStatus = response.status;
+          let errorBody = '';
+          // Log detailed error only if DEBUG_MODE is true
+          if (DEBUG_MODE) {
+            errorBody = await response.text();
+            console.error(`GitHub getUser API error: Status ${errorStatus}, Body: ${errorBody}`);
+          } else {
+            console.error(`GitHub getUser API error: Status ${errorStatus}`);
+          }
+          // Use a more specific error message if possible from the body in debug mode
+          const errorMessage = DEBUG_MODE && errorBody ? `GitHub API error: ${errorStatus} - ${errorBody}` : `GitHub API error: ${errorStatus}`;
+          throw new Error(errorMessage);
         }
 
         const userData = await response.json();
-
-        return json(
-          { user: userData },
-          {
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            },
-          },
-        );
+        return json({ user: userData }, { headers: corsHeaders });
       }
 
+      // --- Get Repos Action ---
       if (action === 'getRepos') {
         const reposResponse = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated', {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: githubApiHeaders,
         });
 
         if (!reposResponse.ok) {
-          console.error('GitHub repos API error:', reposResponse.status);
-          throw new Error(`GitHub API error: ${reposResponse.status}`);
+          const errorStatus = reposResponse.status;
+          let errorBody = '';
+          if (DEBUG_MODE) {
+            errorBody = await reposResponse.text();
+            console.error(`GitHub getRepos API error: Status ${errorStatus}, Body: ${errorBody}`);
+          } else {
+            console.error(`GitHub getRepos API error: Status ${errorStatus}`);
+          }
+          const errorMessage = DEBUG_MODE && errorBody ? `GitHub API error: ${errorStatus} - ${errorBody}` : `GitHub API error: ${errorStatus}`;
+          throw new Error(errorMessage);
         }
-
         const repos = (await reposResponse.json()) as GitHubRepo[];
 
-        // Get user's gists
-        const gistsResponse = await fetch('https://api.github.com/gists', {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            Authorization: `Bearer ${token}`,
-          },
-        });
+        // Get user's gists (optional, handle potential failure gracefully)
+        let gists: GitHubGist[] = [];
+        try {
+          const gistsResponse = await fetch('https://api.github.com/gists', {
+            headers: githubApiHeaders,
+          });
+          if (gistsResponse.ok) {
+            gists = (await gistsResponse.json()) as GitHubGist[];
+          } else if (DEBUG_MODE) {
+            // Log gist fetch error only in debug mode, but don't fail the whole request
+            const errorStatus = gistsResponse.status;
+            const errorBody = await gistsResponse.text();
+            console.warn(`GitHub getGists minor API error: Status ${errorStatus}, Body: ${errorBody}`);
+          } else {
+             console.warn(`GitHub getGists minor API error: Status ${gistsResponse.status}`);
+          }
+        } catch (gistError) {
+           if (DEBUG_MODE) {
+             console.warn(`Error fetching gists: ${gistError instanceof Error ? gistError.message : gistError}`);
+           }
+        }
 
-        const gists = gistsResponse.ok ? ((await gistsResponse.json()) as GitHubGist[]) : [];
 
         // Calculate language statistics
         const languageStats: Record<string, number> = {};
@@ -174,35 +210,10 @@ export const loader: LoaderFunction = async ({ request, context }: LoaderFunctio
         for (const repo of repos) {
           totalStars += repo.stargazers_count || 0;
           totalForks += repo.forks_count || 0;
-
           if (repo.language && repo.language !== 'null') {
             languageStats[repo.language] = (languageStats[repo.language] || 0) + 1;
           }
-
-          /*
-           * Optionally fetch languages for each repo for more accurate stats
-           * This is commented out to avoid rate limiting
-           *
-           * if (repo.languages_url) {
-           *   try {
-           *     const langResponse = await fetch(repo.languages_url, {
-           *       headers: {
-           *         Accept: 'application/vnd.github.v3+json',
-           *         Authorization: `Bearer ${token}`,
-           *       },
-           *     });
-           *
-           *     if (langResponse.ok) {
-           *       const languages = await langResponse.json();
-           *       Object.keys(languages).forEach(lang => {
-           *         languageStats[lang] = (languageStats[lang] || 0) + languages[lang];
-           *       });
-           *     }
-           *   } catch (error) {
-           *     console.error(`Error fetching languages for ${repo.name}:`, error);
-           *   }
-           * }
-           */
+          // Fetching languages per repo is too intensive - avoid
         }
 
         return json(
@@ -215,101 +226,117 @@ export const loader: LoaderFunction = async ({ request, context }: LoaderFunctio
               totalGists: gists.length,
             },
           },
-          {
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            },
-          },
+          { headers: corsHeaders },
         );
       }
 
+      // --- Get Orgs Action ---
       if (action === 'getOrgs') {
         const response = await fetch('https://api.github.com/user/orgs', {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: githubApiHeaders,
         });
 
         if (!response.ok) {
-          console.error('GitHub orgs API error:', response.status);
-          throw new Error(`GitHub API error: ${response.status}`);
+          const errorStatus = response.status;
+          let errorBody = '';
+          if (DEBUG_MODE) {
+            errorBody = await response.text();
+            console.error(`GitHub getOrgs API error: Status ${errorStatus}, Body: ${errorBody}`);
+          } else {
+             console.error(`GitHub getOrgs API error: Status ${errorStatus}`);
+          }
+          const errorMessage = DEBUG_MODE && errorBody ? `GitHub API error: ${errorStatus} - ${errorBody}` : `GitHub API error: ${errorStatus}`;
+          throw new Error(errorMessage);
         }
 
         const orgs = await response.json();
-
-        return json(
-          { organizations: orgs },
-          {
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            },
-          },
-        );
+        return json({ organizations: orgs }, { headers: corsHeaders });
       }
 
+      // --- Get Activity Action ---
       if (action === 'getActivity') {
-        const username = request.headers
+        // Attempt to get username from token if not in cookie (more robust)
+        let username = request.headers
           .get('Cookie')
           ?.split(';')
           .find((cookie) => cookie.trim().startsWith('githubUsername='))
           ?.split('=')[1];
 
+        // If username not in cookie, try fetching from /user endpoint
         if (!username) {
-          console.error('GitHub username not found in cookies');
+          if (DEBUG_MODE) console.log('Username not in cookie, attempting to fetch from /user');
+           try {
+             const userResponse = await fetch('https://api.github.com/user', { headers: githubApiHeaders });
+             if (userResponse.ok) {
+               const userData = await userResponse.json();
+               username = userData.login;
+               if (DEBUG_MODE) console.log(`Fetched username: ${username}`);
+             } else {
+                if (DEBUG_MODE) {
+                  const errorStatus = userResponse.status;
+                  const errorBody = await userResponse.text();
+                  console.error(`Failed to fetch username for activity: Status ${errorStatus}, Body: ${errorBody}`);
+                } else {
+                   console.error(`Failed to fetch username for activity: Status ${userResponse.status}`);
+                }
+             }
+           } catch (userFetchError) {
+             if (DEBUG_MODE) {
+                console.error(`Error fetching username for activity: ${userFetchError instanceof Error ? userFetchError.message : userFetchError}`);
+             }
+           }
+        }
+
+
+        if (!username) {
+          console.error('GitHub username could not be determined for activity feed.');
           return json(
-            { error: 'GitHub username not found in cookies' },
+            { error: 'GitHub username could not be determined.' },
             {
-              status: 400,
-              headers: {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-              },
+              status: 400, // Bad Request as username is missing
+              headers: corsHeaders,
             },
           );
         }
 
         const response = await fetch(`https://api.github.com/users/${username}/events?per_page=30`, {
-          headers: {
-            Accept: 'application/vnd.github.v3+json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: githubApiHeaders, // Use the same headers including User-Agent
         });
 
         if (!response.ok) {
-          console.error('GitHub activity API error:', response.status);
-          throw new Error(`GitHub API error: ${response.status}`);
+          const errorStatus = response.status;
+          let errorBody = '';
+          if (DEBUG_MODE) {
+            errorBody = await response.text();
+            console.error(`GitHub getActivity API error: Status ${errorStatus}, Body: ${errorBody}`);
+          } else {
+            console.error(`GitHub getActivity API error: Status ${errorStatus}`);
+          }
+          const errorMessage = DEBUG_MODE && errorBody ? `GitHub API error: ${errorStatus} - ${errorBody}` : `GitHub API error: ${errorStatus}`;
+          throw new Error(errorMessage);
         }
 
         const events = await response.json();
-
-        return json(
-          { recentActivity: events },
-          {
-            headers: {
-              'Access-Control-Allow-Origin': '*',
-              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            },
-          },
-        );
+        return json({ recentActivity: events }, { headers: corsHeaders });
       }
+
+    // Catch block for GitHub API related errors within the action block
     } catch (error) {
-      console.error('GitHub API error:', error);
+      // Log the specific error thrown from the try block
+      console.error('GitHub API action failed:', error instanceof Error ? error.message : error);
+      // Return a 500 Internal Server Error, as the server failed to process the request
       return json(
-        { error: error instanceof Error ? error.message : 'Unknown error' },
+        { error: 'Failed to process GitHub API request.', details: error instanceof Error ? error.message : 'Unknown internal error' },
         {
           status: 500,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          },
+          headers: corsHeaders,
         },
       );
     }
   }
 
+  // --- Fallback/Default Action (if no specific GitHub action matched) ---
+  // This part provides local git info injected at build time.
   const gitInfo: GitInfo = {
     local: {
       commitHash: typeof __COMMIT_HASH !== 'undefined' ? __COMMIT_HASH : 'development',
@@ -323,10 +350,5 @@ export const loader: LoaderFunction = async ({ request, context }: LoaderFunctio
     timestamp: new Date().toISOString(),
   };
 
-  return json(gitInfo, {
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    },
-  });
+  return json(gitInfo, { headers: corsHeaders });
 };
